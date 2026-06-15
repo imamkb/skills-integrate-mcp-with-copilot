@@ -8,74 +8,62 @@ for extracurricular activities at Mergington High School.
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
-import os
 from pathlib import Path
+from typing import Dict
+
+from .db import activities_collection
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
-app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
-          "static")), name="static")
+app.mount("/static", StaticFiles(directory=current_dir / "static"), name="static")
 
-# In-memory activity database
-activities = {
+# Seed data (kept here to bootstrap DB on first run)
+SEED_ACTIVITIES = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
         "schedule": "Fridays, 3:30 PM - 5:00 PM",
         "max_participants": 12,
-        "participants": ["michael@mergington.edu", "daniel@mergington.edu"]
+        "participants": ["michael@mergington.edu", "daniel@mergington.edu"],
     },
     "Programming Class": {
         "description": "Learn programming fundamentals and build software projects",
         "schedule": "Tuesdays and Thursdays, 3:30 PM - 4:30 PM",
         "max_participants": 20,
-        "participants": ["emma@mergington.edu", "sophia@mergington.edu"]
+        "participants": ["emma@mergington.edu", "sophia@mergington.edu"],
     },
     "Gym Class": {
         "description": "Physical education and sports activities",
         "schedule": "Mondays, Wednesdays, Fridays, 2:00 PM - 3:00 PM",
         "max_participants": 30,
-        "participants": ["john@mergington.edu", "olivia@mergington.edu"]
+        "participants": ["john@mergington.edu", "olivia@mergington.edu"],
     },
-    "Soccer Team": {
-        "description": "Join the school soccer team and compete in matches",
-        "schedule": "Tuesdays and Thursdays, 4:00 PM - 5:30 PM",
-        "max_participants": 22,
-        "participants": ["liam@mergington.edu", "noah@mergington.edu"]
-    },
-    "Basketball Team": {
-        "description": "Practice and play basketball with the school team",
-        "schedule": "Wednesdays and Fridays, 3:30 PM - 5:00 PM",
-        "max_participants": 15,
-        "participants": ["ava@mergington.edu", "mia@mergington.edu"]
-    },
-    "Art Club": {
-        "description": "Explore your creativity through painting and drawing",
-        "schedule": "Thursdays, 3:30 PM - 5:00 PM",
-        "max_participants": 15,
-        "participants": ["amelia@mergington.edu", "harper@mergington.edu"]
-    },
-    "Drama Club": {
-        "description": "Act, direct, and produce plays and performances",
-        "schedule": "Mondays and Wednesdays, 4:00 PM - 5:30 PM",
-        "max_participants": 20,
-        "participants": ["ella@mergington.edu", "scarlett@mergington.edu"]
-    },
-    "Math Club": {
-        "description": "Solve challenging problems and participate in math competitions",
-        "schedule": "Tuesdays, 3:30 PM - 4:30 PM",
-        "max_participants": 10,
-        "participants": ["james@mergington.edu", "benjamin@mergington.edu"]
-    },
-    "Debate Team": {
-        "description": "Develop public speaking and argumentation skills",
-        "schedule": "Fridays, 4:00 PM - 5:30 PM",
-        "max_participants": 12,
-        "participants": ["charlotte@mergington.edu", "henry@mergington.edu"]
-    }
 }
+
+
+def _doc_to_activity_doc(doc: Dict) -> Dict:
+    # Convert Mongo document to API-friendly dict
+    return {
+        "description": doc.get("description", ""),
+        "schedule": doc.get("schedule", ""),
+        "max_participants": int(doc.get("max_participants", 0)),
+        "participants": doc.get("participants", []),
+    }
+
+
+@app.on_event("startup")
+def startup_seed_db():
+    col = activities_collection()
+    # If empty, seed with initial activities
+    if col.count_documents({}) == 0:
+        seed_docs = []
+        for name, values in SEED_ACTIVITIES.items():
+            doc = {"name": name, **values}
+            seed_docs.append(doc)
+        if seed_docs:
+            col.insert_many(seed_docs)
 
 
 @app.get("/")
@@ -85,48 +73,48 @@ def root():
 
 @app.get("/activities")
 def get_activities():
-    return activities
+    col = activities_collection()
+    docs = list(col.find({}))
+    # Return same shape as before: mapping by activity name
+    result = {}
+    for d in docs:
+        name = d.get("name")
+        if name:
+            result[name] = _doc_to_activity_doc(d)
+    return result
 
 
 @app.post("/activities/{activity_name}/signup")
 def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
+    col = activities_collection()
+    doc = col.find_one({"name": activity_name})
+    if not doc:
         raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
+    participants = doc.get("participants", [])
+    if email in participants:
+        raise HTTPException(status_code=400, detail="Student is already signed up")
 
-    # Validate student is not already signed up
-    if email in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is already signed up"
-        )
+    maxp = int(doc.get("max_participants", 0))
+    if maxp and len(participants) >= maxp:
+        raise HTTPException(status_code=400, detail="Activity is full")
 
-    # Add student
-    activity["participants"].append(email)
+    participants.append(email)
+    col.update_one({"_id": doc["_id"]}, {"$set": {"participants": participants}})
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
 def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
+    col = activities_collection()
+    doc = col.find_one({"name": activity_name})
+    if not doc:
         raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
+    participants = doc.get("participants", [])
+    if email not in participants:
+        raise HTTPException(status_code=400, detail="Student is not signed up for this activity")
 
-    # Validate student is signed up
-    if email not in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is not signed up for this activity"
-        )
-
-    # Remove student
-    activity["participants"].remove(email)
+    participants.remove(email)
+    col.update_one({"_id": doc["_id"]}, {"$set": {"participants": participants}})
     return {"message": f"Unregistered {email} from {activity_name}"}
